@@ -53,6 +53,15 @@ export default function ResultsPanel({ result, error }) {
                 </span>
             </div>
 
+            {result.particles_summary?.stranded_particles > 0 && (
+                <div className="result-item">
+                    <span className="result-label">Em Terra</span>
+                    <span className="result-value" style={{ color: 'var(--color-warning)' }}>
+                        {result.particles_summary.stranded_particles}
+                    </span>
+                </div>
+            )}
+
             <div style={{ marginTop: 'var(--spacing-md)' }}>
                 <div className="status-badge success">
                     <span>●</span>

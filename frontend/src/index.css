@@ -307,6 +307,7 @@ body {
   border-top-color: var(--color-primary);
   border-radius: 50%;
   animation: spin 1s linear infinite;
+  margin: 0 auto;
 }
 
 @keyframes spin {

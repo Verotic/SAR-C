@@ -12,6 +12,7 @@ import xarray as xr
 from scipy import ndimage
 from shapely.geometry import MultiPoint, Polygon
 from shapely.ops import unary_union
+from global_land_mask import globe
 
 from app.models.drift import ObjectType, DriftResponse
 from app.services.leeway import (
@@ -37,6 +38,7 @@ class SimulationResult:
     priority_polygon: dict  # GeoJSON (80% confidence)
     mean_drift_km: float
     simulation_time_seconds: float
+    stranded_particle_count: int = 0
 
 
 class MonteCarloSimulator:
@@ -91,6 +93,9 @@ class MonteCarloSimulator:
         particles_lat = np.full(num_particles, start_lat) + rng.normal(0, initial_spread, num_particles)
         particles_lon = np.full(num_particles, start_lon) + rng.normal(0, initial_spread, num_particles)
         
+        # Track stranded particles (those that have hit land)
+        stranded = np.zeros(num_particles, dtype=bool)
+        
         # Number of time steps
         num_steps = int(projection_hours / time_step_hours)
         current_time = start_time
@@ -101,8 +106,18 @@ class MonteCarloSimulator:
             current_u, current_v = self._get_current_at_time(current_time, particles_lat, particles_lon)
             wind_u, wind_v = self._get_wind_at_time(current_time, particles_lat, particles_lon)
             
-            # Update each particle
-            for i in range(num_particles):
+            # Get indices of active (non-stranded) particles
+            active_indices = np.where(~stranded)[0]
+            
+            if len(active_indices) == 0:
+                break
+            
+            # Update each particle (only active ones)
+            # Store previous positions to revert if stranded
+            prev_lats = particles_lat[active_indices].copy()
+            prev_lons = particles_lon[active_indices].copy()
+
+            for idx, i in enumerate(active_indices):
                 # Calculate velocity with noise
                 vel_u, vel_v = calculate_leeway_velocity_with_noise(
                     current_u[i] if isinstance(current_u, np.ndarray) else current_u,
@@ -122,6 +137,21 @@ class MonteCarloSimulator:
                 particles_lat[i] += delta_lat * time_step_hours
                 particles_lon[i] += delta_lon * time_step_hours
             
+            # Check for stranding after position update
+            if len(active_indices) > 0:
+                newly_stranded_mask = globe.is_land(particles_lat[active_indices], particles_lon[active_indices])
+                
+                # For newly stranded particles, revert to previous position (last known water position)
+                if np.any(newly_stranded_mask):
+                    stranded_indices = active_indices[newly_stranded_mask]
+                    # Map back to the local index in active_indices to get prev pos
+                    local_indices = np.where(newly_stranded_mask)[0]
+                    
+                    particles_lat[stranded_indices] = prev_lats[local_indices]
+                    particles_lon[stranded_indices] = prev_lons[local_indices]
+                    
+                    stranded[stranded_indices] = True
+            
             current_time += timedelta(hours=time_step_hours)
         
         # Calculate results
@@ -137,14 +167,16 @@ class MonteCarloSimulator:
         )
         
         sim_time = time.time() - sim_start
-        logger.info(f"Simulation completed in {sim_time:.2f} seconds")
+        stranded_count = np.sum(stranded)
+        logger.info(f"Simulation completed in {sim_time:.2f} seconds. Stranded particles: {stranded_count}/{num_particles}")
         
         return SimulationResult(
             final_positions=final_positions,
             search_polygon=search_polygon,
             priority_polygon=priority_polygon,
             mean_drift_km=mean_drift_km,
-            simulation_time_seconds=sim_time
+            simulation_time_seconds=sim_time,
+            stranded_particle_count=int(stranded_count)
         )
     
     def _get_current_at_time(
@@ -222,6 +254,9 @@ class MonteCarloSimulator:
         confidence: float = 0.80
     ) -> dict:
         """Create a polygon containing the specified percentage of particles."""
+        if not positions:
+            return {"type": "Polygon", "coordinates": [[]]}
+            
         lats = np.array([p[0] for p in positions])
         lons = np.array([p[1] for p in positions])
         
@@ -232,22 +267,21 @@ class MonteCarloSimulator:
         # Calculate distances from center
         distances = np.sqrt((lats - center_lat)**2 + (lons - center_lon)**2)
         
-        # Find radius containing 80% of particles
-        sorted_distances = np.sort(distances)
-        confidence_index = int(len(sorted_distances) * confidence)
-        radius = sorted_distances[confidence_index]
+        # Find threshold distance for confidence interval
+        sorted_indices = np.argsort(distances)
+        cutoff_index = int(len(positions) * confidence)
         
-        # Create circular polygon
-        angles = np.linspace(0, 2*np.pi, 32)
-        polygon_lons = center_lon + radius * np.cos(angles)
-        polygon_lats = center_lat + radius * np.sin(angles)
+        # Select the closest points
+        selected_indices = sorted_indices[:cutoff_index]
         
-        coords = [list(zip(polygon_lons, polygon_lats))]
-        
-        return {
-            "type": "Polygon",
-            "coordinates": coords
-        }
+        # If too few points, just return hull of all or empty
+        if len(selected_indices) < 3:
+            selected_positions = positions
+        else:
+            selected_positions = [positions[i] for i in selected_indices]
+            
+        # Create convex hull of these points
+        return self._create_convex_hull(selected_positions)
     
     def _calculate_mean_drift(
         self,

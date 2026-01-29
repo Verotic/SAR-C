@@ -143,5 +143,6 @@ async def preview_drift(request: DriftRequest):
     return {
         "preview": True,
         "search_area": result.search_polygon,
-        "estimated_drift_km": result.mean_drift_km
+        "estimated_drift_km": result.mean_drift_km,
+        "stranded_particles": result.stranded_particle_count
     }
